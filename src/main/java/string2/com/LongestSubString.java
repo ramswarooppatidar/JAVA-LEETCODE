@@ -1,0 +1,114 @@
+package string2.com;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+public class LongestSubString {
+	
+	public static String longestSubstring(String s) {
+		String longestSubString = "";
+		StringBuilder sBuilder = new StringBuilder();
+		for(int i =0; i<s.length(); i++) {
+			char ch = s.charAt(i);
+			if(sBuilder.indexOf(String.valueOf(ch)) == -1) {
+				sBuilder.append(ch);
+			}else {
+				int length = sBuilder.length();
+				if(sBuilder.length()>longestSubString.length()) {
+					longestSubString = sBuilder.toString();
+//					sBuilder = new StringBuilder();
+				}
+				while(sBuilder.length()>0 && sBuilder.indexOf(String.valueOf(ch)) != -1) {
+					sBuilder.deleteCharAt(0);
+				}
+				sBuilder.append(ch);
+			}
+		}
+		return sBuilder.length()>longestSubString.length() ? sBuilder.toString() : longestSubString;
+	}
+	//sliding window
+	//time complexity O(n^2) in worst case remove at indexo(n) due to shifting all elements
+	public static String longestSubString(String s) {
+		List<Character> list = new ArrayList<>();
+		int left =0;
+//		int right = 0;
+		int maxLen = 0;
+		String resuString="";
+		for(int right = 0; right<s.length(); right++) {
+			while(list.contains(s.charAt(right))) {
+				list.remove(0);
+				left++;
+			}
+			list.add(s.charAt(right));
+			if(right - left + 1>maxLen) {
+				maxLen = right - left + 1;
+				resuString = s.substring(left, right+1);
+			}
+		}
+		return resuString;
+	}
+	
+	public static String longestSubStringOptimized(String s) {
+		Set<Character> set = new HashSet();
+		int left =0;
+//		int right = 0;
+		int maxLen = 0;
+		String resuString="";
+		for(int right = 0; right<s.length(); right++) {
+			while(set.contains(s.charAt(right))) {
+				set.remove(s.charAt(left));
+				left++;
+			}
+			set.add(s.charAt(right));
+			if(right - left + 1>maxLen) {
+				maxLen = right - left + 1;
+				resuString = s.substring(left, right+1);
+			}
+		}
+		return resuString;
+	}
+	public static String solutions(String s) {
+		String resultString = "";
+		StringBuilder sb = new StringBuilder();
+		for(int i =0; i<s.length();i++){
+			char ch = s.charAt(i);
+			if(sb.indexOf(String.valueOf(ch)) == -1) {
+				sb.append(ch);
+			}else {
+				if(sb.length() > resultString.length()) {
+					resultString = sb.toString();
+				}
+				while(sb.length() > 0 && sb.indexOf(String.valueOf(ch)) != -1) {
+					sb.deleteCharAt(0);
+				}
+				
+				sb.append(ch);
+				
+			}
+			
+		}
+		return sb.length() > resultString.length()? sb.toString() : resultString;
+	}
+
+	public static void main(String[] args) {
+		// TODO Auto-generated method stub
+		String string ="adcvsbdghsbaba";
+	String reString=	longestSubString(string);
+	System.out.println(reString);
+	
+	String string1 ="adcvsbdghsbaba";
+	String reString1 =	longestSubStringOptimized(string1);
+	System.out.println(reString1);
+	
+	String reString2 = longestSubstring("adcvsbdghsbaba");
+	System.out.println(reString2);
+	
+	String reString3 = solutions("adcmnvsbdghsbaba");
+	System.out.println(reString3);
+	
+
+	}
+
+}
