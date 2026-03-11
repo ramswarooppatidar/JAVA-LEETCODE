@@ -436,12 +436,12 @@ public class treeUse_2 {
         BinaryTreeNode<Integer> leftChild_r1 = new BinaryTreeNode<Integer>(6);
         rightChild.left = leftChild_r1;
 
-        // printTree(root);
+//         printTree(root);
 
         // printDetails(root);
 
-        // BinaryTreeNode<Integer> root_ = takeUserInput();
-        // printDetails(root_);
+//         BinaryTreeNode<Integer> root_ = takeUserInput();
+//         printDetails(root_);
 
         // BinaryTreeNode<Integer> root_ = takeUserInputBatter(true, 0, true);
         // printDetails(root_);
