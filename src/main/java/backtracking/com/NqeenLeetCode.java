@@ -3,7 +3,7 @@ package backtracking.com;
 import java.util.ArrayList;
 import java.util.List;
 public class NqeenLeetCode {
-	public List<List<String>> solveNQueens(int n) {
+	public static List<List<String>> solveNQueens(int n) {
         char board[][] = new char[n][n];
         for(int i =0; i<n; i++) {
 			for(int j =0; j<n; j++) {
@@ -15,7 +15,7 @@ public class NqeenLeetCode {
         return result;
 
     }
-    public void placeQueens(char board[][], int n, int row, List<List<String>> result) {
+    public static void placeQueens(char board[][], int n, int row, List<List<String>> result) {
 		if(row == n) {
 			// printBoard(n, board);
             List<String> sunAns = new ArrayList<>();
@@ -61,6 +61,17 @@ public class NqeenLeetCode {
 	}
 	public static void main(String[] args) {
 		// TODO Auto-generated method stub
+//        System.out.print(solveNQueens(8));
+        List<List<String>> res = solveNQueens(8);
+        int count =0;
+        for(List<String> l : res){
+            for(String s : l){
+                System.out.println(s);
+            }
+
+            System.out.println("**********************************************************************");
+            System.out.println("Possible solution is :"+count++);
+        }
 
 	}
 
