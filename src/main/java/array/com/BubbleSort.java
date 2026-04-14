@@ -2,6 +2,22 @@ package array.com;
 
 public class BubbleSort {
 
+    public static void sortBubble(int arr[]){
+        int n = arr.length;
+        for(int i = 0; i<n- 1; i++){
+            for(int j = i+ 1; j<n -1- i; j++){
+                if(arr[j]<arr[i]){
+                    int temp = arr[j];
+                    arr[j] = arr[i];
+                    arr[i] = temp;
+                }
+            }
+//            for(Integer m: arr) {
+//                System.out.print(m+" ");
+//            }
+            System.out.println("");
+        }
+    }
 	//improved time compexity
 	public static void bubbleSort(int arr[]) {
 		int n = arr.length;
@@ -23,7 +39,7 @@ public class BubbleSort {
 	public static void bubbleSort_2(int arr[]) {
 		for(int i =0; i<arr.length-1; i++) {
 			for(int j =i+1; j<arr.length-i; j++) {
-				if(arr[j]<arr[i]) {
+				if(arr[j] < arr[i]) {
 					int temp = arr[j];
 					arr[j] = arr[i];
 					arr[i] = temp;
@@ -35,7 +51,8 @@ public class BubbleSort {
 		// TODO Auto-generated method stub
 		int arr[]= {2,14,6,9,23,15,67,0,-1,33,40,11,19,29,44,56,78,23,5,7,8,99,123};
 //		bubbleSort(arr);
-		bubbleSort_2(arr);
+//		bubbleSort_2(arr);
+        sortBubble(arr);
 		for(Integer i : arr) {
 			System.out.print(i+" ");
 		}
