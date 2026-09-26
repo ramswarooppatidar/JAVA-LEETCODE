@@ -18,6 +18,7 @@ public class TRansPoseMatrix {
             mat = temp;
             k++;
         }
+        return false;
     }
     private static boolean compare(int mat[][],int target[][]){
         for(int i =0; i<mat.length; i++){
