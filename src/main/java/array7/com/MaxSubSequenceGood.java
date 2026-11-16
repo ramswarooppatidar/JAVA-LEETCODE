@@ -62,7 +62,7 @@ public class MaxSubSequenceGood {
         int arr2[] = {3,4,3,3,6,7,11,23,34,89,45,1,-23,-45,55,7,34,55,78,87,-34,-56,98,73,82};
         maxSubSequence(arr2, 7);
         /*
-        ou are given an integer array nums and an integer k. You want to find a subsequence of nums of length k that has the largest sum.
+        our are given an integer array nums and an integer k. You want to find a subsequence of nums of length k that has the largest sum.
         Return any such subsequence as an integer array of length k.
         A subsequence is an array that can be derived from another array by deleting some or no elements without changing the order of the remaining elements.
         Example 1:
