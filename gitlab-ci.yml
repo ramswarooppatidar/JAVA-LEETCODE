@@ -1,0 +1,661 @@
+# .gitlab-ci.yml
+#
+# Pipeline design:
+#   MR              -> validate, build, unit tests, integration tests, SonarQube
+#   feature push    -> validate, build, tests, SonarQube (no image/version/deploy)
+#   develop         -> tests, SHA image, ECR push, DEV deploy
+#   test            -> tests, SHA image, ECR push, TEST deploy
+#   staging         -> tests, SHA image, ECR push, STG deploy
+#   master          -> tests, release version, Docker build/push (no PROD deploy)
+#   vX.Y.Z tag      -> verify existing ECR image, PROD deploy is MANUAL
+#
+# Required:
+# - GitLab Runner with Docker-in-Docker support (privileged runner).
+# - Dockerfile in the repository.
+# - Terraform code under infra/ with an S3 backend (backend "s3" {}).
+# - ECS task definition family and container name configured as CI/CD variables.
+# - AWS IAM roles configured for GitLab OIDC; do not store long-lived AWS keys.
+# - Maven integration-test profile and SonarQube project configured.
+#
+# Important:
+# Master creates image tag v1.0.<CI_PIPELINE_IID>.
+# Create a Git tag with exactly that value on the same master commit.
+# The tag pipeline deploys the already-built image; it does not rebuild it.
+
+workflow:
+  rules:
+    # Always create a merge-request pipeline.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: always
+
+    # A pushed Git tag starts a release pipeline.
+    - if: '$CI_COMMIT_TAG'
+      when: always
+
+    # Avoid duplicate branch + MR pipelines for the same push.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+
+    # Normal branch pipelines.
+    - if: '$CI_COMMIT_BRANCH'
+      when: always
+
+    - when: never
+
+stages:
+  - validate
+  - build
+  - test
+  - integration_test
+  - sonar
+  - version
+  - infra
+  - package
+  - deploy
+  - post_deploy
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end"
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_HOST: "tcp://docker:2376"
+  DOCKER_TLS_VERIFY: "1"
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+  # Set these in GitLab -> Settings -> CI/CD -> Variables.
+  AWS_REGION: "ap-south-1"
+  ECR_REPOSITORY: "springboot-app"
+  ECS_TASK_DEFINITION_FAMILY: "springboot-app"
+  ECS_CONTAINER_NAME: "springboot-app"
+
+  # Terraform variables. The backend block in infra/ should be:
+  # terraform { backend "s3" {} }
+  TF_ROOT: "infra"
+  TF_STATE_BUCKET: "REPLACE_WITH_TERRAFORM_STATE_BUCKET"
+
+  # SonarQube variables to configure in GitLab:
+  # SONAR_HOST_URL, SONAR_TOKEN, SONAR_PROJECT_KEY
+
+cache:
+  key: "$CI_PROJECT_ID-maven"
+  paths:
+    - .m2/repository/
+
+# -------------------------------------------------------------------
+# Reusable AWS OIDC authentication.
+# Each AWS job sets AWS_ROLE_ARN through its rules or project variables.
+# Configure the IAM role trust policy to trust this GitLab project's OIDC
+# issuer and the sts.amazonaws.com audience.
+# -------------------------------------------------------------------
+.aws_oidc:
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - |
+      set -eu
+      if [ -z "${AWS_ROLE_ARN:-}" ]; then
+        echo "AWS_ROLE_ARN is not configured for this environment."
+        exit 1
+      fi
+      CREDS="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_ROLE_ARN" \
+        --role-session-name "gitlab-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $CREDS
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+      export AWS_DEFAULT_REGION="$AWS_REGION"
+      aws sts get-caller-identity
+
+# -------------------------------------------------------------------
+# VALIDATE
+# -------------------------------------------------------------------
+validate:
+  stage: validate
+  image: maven:3.9.9-eclipse-temurin-17
+  script:
+    - mvn $MAVEN_CLI_OPTS validate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+  artifacts:
+    when: always
+    expire_in: 1 week
+
+# -------------------------------------------------------------------
+# BUILD
+# -------------------------------------------------------------------
+build:
+  stage: build
+  image: maven:3.9.9-eclipse-temurin-17
+  script:
+    # Compile and package. Tests run in their own jobs below.
+    - mvn $MAVEN_CLI_OPTS -DskipTests package
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 1 day
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# -------------------------------------------------------------------
+# UNIT TESTS
+# -------------------------------------------------------------------
+unit_tests:
+  stage: test
+  image: maven:3.9.9-eclipse-temurin-17
+  script:
+    - mvn $MAVEN_CLI_OPTS test
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# -------------------------------------------------------------------
+# INTEGRATION TESTS
+# Configure an "integration" Maven profile (usually with Maven Failsafe).
+# This command may also execute unit tests depending on your pom.xml setup.
+# -------------------------------------------------------------------
+integration_tests:
+  stage: integration_test
+  image: maven:3.9.9-eclipse-temurin-17
+  script:
+    - mvn $MAVEN_CLI_OPTS verify -Pintegration
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - target/failsafe-reports/TEST-*.xml
+    expire_in: 1 week
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# -------------------------------------------------------------------
+# SONARQUBE
+# For SonarQube merge-request decoration/analysis, the SonarQube edition
+# and GitLab integration must support MR analysis.
+# -------------------------------------------------------------------
+sonar_scan:
+  stage: sonar
+  image: maven:3.9.9-eclipse-temurin-17
+  needs:
+    - job: build
+      artifacts: true
+    - job: unit_tests
+      artifacts: false
+    - job: integration_tests
+      artifacts: false
+  script:
+    - |
+      if [ -z "${SONAR_HOST_URL:-}" ] || [ -z "${SONAR_TOKEN:-}" ] || [ -z "${SONAR_PROJECT_KEY:-}" ]; then
+        echo "Configure SONAR_HOST_URL, SONAR_TOKEN and SONAR_PROJECT_KEY in GitLab CI/CD variables."
+        exit 1
+      fi
+
+      SONAR_ARGS="-Dsonar.host.url=$SONAR_HOST_URL \
+        -Dsonar.token=$SONAR_TOKEN \
+        -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+        -Dsonar.qualitygate.wait=true"
+
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+        SONAR_ARGS="$SONAR_ARGS \
+          -Dsonar.pullrequest.key=$CI_MERGE_REQUEST_IID \
+          -Dsonar.pullrequest.branch=$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME \
+          -Dsonar.pullrequest.base=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      elif [ -n "${CI_COMMIT_BRANCH:-}" ] && [ "$CI_COMMIT_BRANCH" != "master" ]; then
+        SONAR_ARGS="$SONAR_ARGS -Dsonar.branch.name=$CI_COMMIT_BRANCH"
+      fi
+
+      mvn $MAVEN_CLI_OPTS sonar:sonar $SONAR_ARGS
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# -------------------------------------------------------------------
+# VERSIONING
+# MR and feature branch pipelines do not create a version.
+# Deploy branches use immutable commit-SHA image tags, not release versions.
+# Master creates a release-style version: v1.0.<pipeline IID>.
+# -------------------------------------------------------------------
+set_image_tag:
+  stage: version
+  image: alpine:3.20
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "master" ]; then
+        IMAGE_TAG="v1.0.${CI_PIPELINE_IID}"
+        RELEASE_VERSION="$IMAGE_TAG"
+      else
+        IMAGE_TAG="sha-${CI_COMMIT_SHORT_SHA}"
+        RELEASE_VERSION=""
+      fi
+
+      printf "IMAGE_TAG=%s\n" "$IMAGE_TAG" > image.env
+      printf "RELEASE_VERSION=%s\n" "$RELEASE_VERSION" >> image.env
+      echo "Image tag: $IMAGE_TAG"
+      if [ -n "$RELEASE_VERSION" ]; then
+        echo "Release version: $RELEASE_VERSION"
+      fi
+  artifacts:
+    reports:
+      dotenv: image.env
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "test"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+# -------------------------------------------------------------------
+# DOCKER BUILD + PUSH TO AWS ECR
+# MR and ordinary feature branches never publish images.
+# -------------------------------------------------------------------
+docker_build_push:
+  stage: package
+  image: docker:27.5.1-cli
+  variables:
+    AWS_ROLE_ARN: "$AWS_ROLE_ARN_ECR"
+  services:
+    - name: docker:27.5.1-dind
+      alias: docker
+  extends: .aws_oidc
+  before_script:
+    - apk add --no-cache aws-cli
+    - |
+      set -eu
+      CREDS="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_ROLE_ARN" \
+        --role-session-name "gitlab-ecr-${CI_PIPELINE_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $CREDS
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+      export AWS_DEFAULT_REGION="$AWS_REGION"
+      aws sts get-caller-identity
+  needs:
+    - job: build
+      artifacts: true
+    - job: set_image_tag
+      artifacts: true
+    - job: integration_tests
+      artifacts: false
+    - job: sonar_scan
+      artifacts: false
+  script:
+    - |
+      set -eu
+      AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+      ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+      IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+      aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null
+      aws ecr get-login-password --region "$AWS_REGION" |
+        docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      docker build --pull -t "$IMAGE_URI" .
+      docker push "$IMAGE_URI"
+
+      printf "IMAGE_URI=%s\n" "$IMAGE_URI" > docker-image.env
+      echo "Published $IMAGE_URI"
+  artifacts:
+    reports:
+      dotenv: docker-image.env
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+    - if: '$CI_COMMIT_BRANCH == "test"'
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+    - if: '$CI_COMMIT_BRANCH == "master"'
+
+# -------------------------------------------------------------------
+# TERRAFORM: VALIDATE
+# -------------------------------------------------------------------
+terraform_validate:
+  stage: validate
+  image: hashicorp/terraform:1.9.8
+  script:
+    - terraform -chdir="$TF_ROOT" fmt -check -recursive
+    - terraform -chdir="$TF_ROOT" init -backend=false
+    - terraform -chdir="$TF_ROOT" validate
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+# -------------------------------------------------------------------
+# TERRAFORM: PLAN
+# Uses separate state keys for dev/test/stg/prod.
+# Set the environment-specific role ARN and variables in GitLab.
+# -------------------------------------------------------------------
+terraform_plan:
+  stage: infra
+  image: hashicorp/terraform:1.9.8
+  extends: .aws_oidc
+  before_script:
+    - apk add --no-cache aws-cli
+    - |
+      set -eu
+      CREDS="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_ROLE_ARN" \
+        --role-session-name "gitlab-tf-plan-${CI_PIPELINE_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $CREDS
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+      export AWS_DEFAULT_REGION="$AWS_REGION"
+  script:
+    - |
+      set -eu
+      terraform -chdir="$TF_ROOT" init \
+        -backend-config="bucket=${TF_STATE_BUCKET}" \
+        -backend-config="key=${TARGET_ENV}/terraform.tfstate" \
+        -backend-config="region=${AWS_REGION}" \
+        -backend-config="encrypt=true"
+      terraform -chdir="$TF_ROOT" plan \
+        -var="environment=${TARGET_ENV}" \
+        -out=tfplan
+      cp "$TF_ROOT/tfplan" tfplan
+  artifacts:
+    paths:
+      - tfplan
+    expire_in: 1 day
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      variables:
+        TARGET_ENV: "dev"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_DEV"
+    - if: '$CI_COMMIT_BRANCH == "test"'
+      variables:
+        TARGET_ENV: "test"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_TEST"
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      variables:
+        TARGET_ENV: "stg"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_STG"
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      variables:
+        TARGET_ENV: "prod"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_PROD"
+
+# -------------------------------------------------------------------
+# TERRAFORM: MANUAL APPLY
+# This is an optional, protected infrastructure operation.
+# App deployment does not depend on this job; provision infrastructure
+# initially or run this job when infrastructure code changes.
+# -------------------------------------------------------------------
+terraform_apply:
+  stage: infra
+  image: hashicorp/terraform:1.9.8
+  extends: .aws_oidc
+  before_script:
+    - apk add --no-cache aws-cli
+    - |
+      set -eu
+      CREDS="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_ROLE_ARN" \
+        --role-session-name "gitlab-tf-apply-${CI_PIPELINE_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $CREDS
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+      export AWS_DEFAULT_REGION="$AWS_REGION"
+  needs:
+    - job: terraform_plan
+      artifacts: true
+  script:
+    - |
+      set -eu
+      terraform -chdir="$TF_ROOT" init \
+        -backend-config="bucket=${TF_STATE_BUCKET}" \
+        -backend-config="key=${TARGET_ENV}/terraform.tfstate" \
+        -backend-config="region=${AWS_REGION}" \
+        -backend-config="encrypt=true"
+      cp tfplan "$TF_ROOT/tfplan"
+      terraform -chdir="$TF_ROOT" apply -auto-approve tfplan
+  when: manual
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+      variables:
+        TARGET_ENV: "dev"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_DEV"
+    - if: '$CI_COMMIT_BRANCH == "test"'
+      variables:
+        TARGET_ENV: "test"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_TEST"
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+      variables:
+        TARGET_ENV: "stg"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_STG"
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      variables:
+        TARGET_ENV: "prod"
+        AWS_ROLE_ARN: "$AWS_ROLE_ARN_PROD"
+
+# -------------------------------------------------------------------
+# Reusable ECS deployment script.
+# It updates the task definition with the immutable image URI, registers
+# a new revision, updates the ECS service, and waits for stability.
+# -------------------------------------------------------------------
+.ecs_deploy:
+  stage: deploy
+  image: alpine:3.20
+  extends: .aws_oidc
+  before_script:
+    - apk add --no-cache aws-cli jq
+    - |
+      set -eu
+      CREDS="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_ROLE_ARN" \
+        --role-session-name "gitlab-ecs-${CI_PIPELINE_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $CREDS
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+      export AWS_DEFAULT_REGION="$AWS_REGION"
+  script:
+    - |
+      set -eu
+
+      if [ -z "${IMAGE_URI:-}" ]; then
+        AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+      fi
+
+      echo "Deploying ${IMAGE_URI} to ${TARGET_ENV}"
+
+      aws ecr describe-images \
+        --repository-name "$ECR_REPOSITORY" \
+        --image-ids "imageTag=${IMAGE_TAG}" >/dev/null
+
+      aws ecs describe-task-definition \
+        --task-definition "$ECS_TASK_DEFINITION_FAMILY" \
+        --query taskDefinition > current-task-definition.json
+
+      jq --arg IMAGE "$IMAGE_URI" --arg CONTAINER "$ECS_CONTAINER_NAME" '
+        del(
+          .taskDefinitionArn,
+          .revision,
+          .status,
+          .requiresAttributes,
+          .compatibilities,
+          .registeredAt,
+          .registeredBy
+        )
+        | .containerDefinitions |= map(
+            if .name == $CONTAINER then .image = $IMAGE else . end
+          )
+      ' current-task-definition.json > new-task-definition.json
+
+      NEW_TASK_DEF_ARN="$(aws ecs register-task-definition \
+        --cli-input-json file://new-task-definition.json \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)"
+
+      aws ecs update-service \
+        --cluster "$ECS_CLUSTER" \
+        --service "$ECS_SERVICE" \
+        --task-definition "$NEW_TASK_DEF_ARN"
+
+      aws ecs wait services-stable \
+        --cluster "$ECS_CLUSTER" \
+        --services "$ECS_SERVICE"
+
+      echo "Deployment completed: ${NEW_TASK_DEF_ARN}"
+
+# -------------------------------------------------------------------
+# DEV DEPLOYMENT
+# -------------------------------------------------------------------
+deploy_dev:
+  extends: .ecs_deploy
+  needs:
+    - job: docker_build_push
+      artifacts: true
+  variables:
+    TARGET_ENV: "dev"
+    AWS_ROLE_ARN: "$AWS_ROLE_ARN_DEV"
+    ECS_CLUSTER: "$ECS_CLUSTER_DEV"
+    ECS_SERVICE: "$ECS_SERVICE_DEV"
+  environment:
+    name: dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# -------------------------------------------------------------------
+# TEST DEPLOYMENT
+# -------------------------------------------------------------------
+deploy_test:
+  extends: .ecs_deploy
+  needs:
+    - job: docker_build_push
+      artifacts: true
+  variables:
+    TARGET_ENV: "test"
+    AWS_ROLE_ARN: "$AWS_ROLE_ARN_TEST"
+    ECS_CLUSTER: "$ECS_CLUSTER_TEST"
+    ECS_SERVICE: "$ECS_SERVICE_TEST"
+  environment:
+    name: test
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "test"'
+
+# -------------------------------------------------------------------
+# STAGING DEPLOYMENT
+# -------------------------------------------------------------------
+deploy_stg:
+  extends: .ecs_deploy
+  needs:
+    - job: docker_build_push
+      artifacts: true
+  variables:
+    TARGET_ENV: "stg"
+    AWS_ROLE_ARN: "$AWS_ROLE_ARN_STG"
+    ECS_CLUSTER: "$ECS_CLUSTER_STG"
+    ECS_SERVICE: "$ECS_SERVICE_STG"
+  environment:
+    name: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+
+# -------------------------------------------------------------------
+# RELEASE IMAGE CHECK
+# A Git tag must match the image tag published by the master pipeline.
+# This job does not rebuild or push the image.
+# -------------------------------------------------------------------
+check_release_image:
+  stage: package
+  image: alpine:3.20
+  extends: .aws_oidc
+  before_script:
+    - apk add --no-cache aws-cli
+    - |
+      set -eu
+      CREDS="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_ROLE_ARN_PROD" \
+        --role-session-name "gitlab-release-check-${CI_PIPELINE_ID}" \
+        --web-identity-token "$AWS_ID_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $CREDS
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+      export AWS_DEFAULT_REGION="$AWS_REGION"
+  script:
+    - |
+      echo "Checking release image ${CI_COMMIT_TAG}"
+      aws ecr describe-images \
+        --repository-name "$ECR_REPOSITORY" \
+        --image-ids "imageTag=${CI_COMMIT_TAG}"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
+# -------------------------------------------------------------------
+# PRODUCTION DEPLOYMENT
+# Runs only in a version-tag pipeline and requires a manual action.
+# Protect the "production" environment in GitLab settings.
+# -------------------------------------------------------------------
+deploy_prod:
+  extends: .ecs_deploy
+  stage: deploy
+  needs:
+    - job: check_release_image
+      artifacts: false
+  variables:
+    TARGET_ENV: "prod"
+    AWS_ROLE_ARN: "$AWS_ROLE_ARN_PROD"
+    ECS_CLUSTER: "$ECS_CLUSTER_PROD"
+    ECS_SERVICE: "$ECS_SERVICE_PROD"
+    IMAGE_TAG: "$CI_COMMIT_TAG"
+  environment:
+    name: production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+      allow_failure: false
+  # The deploy script builds IMAGE_URI from the tag and ECR repository.
+
+# -------------------------------------------------------------------
+# POST-DEPLOYMENT SMOKE TEST
+# Set PROD_HEALTH_URL as a protected GitLab CI/CD variable.
+# -------------------------------------------------------------------
+prod_smoke_test:
+  stage: post_deploy
+  image: curlimages/curl:8.12.1
+  needs:
+    - job: deploy_prod
+      artifacts: false
+  script:
+    - test -n "$PROD_HEALTH_URL"
+    - curl --fail --show-error --silent --retry 10 --retry-delay 6 "$PROD_HEALTH_URL"
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
